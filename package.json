@@ -1,0 +1,9 @@
+{
+  "name": "cortex-onprem-infra",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "cd presentation && npm install && npm run build && cp -r .next ../.next",
+    "dev": "cd presentation && npm run dev",
+    "start": "cd presentation && npm start"
+  }
+}

@@ -1,0 +1,175 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-inference-server
+  namespace: ai-inference
+  labels:
+    app: llm-inference-server
+    model: llama-70b
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: llm-inference-server
+  template:
+    metadata:
+      labels:
+        app: llm-inference-server
+        model: llama-70b
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8002"
+    spec:
+      serviceAccountName: inference-service-account
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+      - name: triton-server
+        image: nvcr.io/nvidia/tritonserver:23.10-py3
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+        - containerPort: 8001
+          name: grpc
+        - containerPort: 8002
+          name: metrics
+        env:
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: TRITON_MODEL_REPOSITORY
+          value: "/models"
+        command:
+        - tritonserver
+        - --model-repository=/models
+        - --allow-http=true
+        - --allow-grpc=true
+        - --allow-metrics=true
+        - --log-verbose=1
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+            memory: "32Gi"
+            cpu: "8"
+          limits:
+            nvidia.com/gpu: 1
+            memory: "64Gi"
+            cpu: "16"
+        livenessProbe:
+          httpGet:
+            path: /v2/health/live
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /v2/health/ready
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+        - name: shared-memory
+          mountPath: /dev/shm
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-storage-pvc
+      - name: shared-memory
+        emptyDir:
+          medium: Memory
+          sizeLimit: "8Gi"
+      nodeSelector:
+        accelerator: nvidia-a100
+        workload-type: inference
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      - key: inference-workload
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - llm-inference-server
+              topologyKey: kubernetes.io/hostname
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-inference-service
+  namespace: ai-inference
+  labels:
+    app: llm-inference-server
+spec:
+  selector:
+    app: llm-inference-server
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  - name: grpc
+    port: 8001
+    targetPort: 8001
+  - name: metrics
+    port: 8002
+    targetPort: 8002
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: llm-inference-hpa
+  namespace: ai-inference
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: llm-inference-server
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Pods
+    pods:
+      metric:
+        name: inference_queue_size
+      target:
+        type: AverageValue
+        averageValue: "10"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60

@@ -1,0 +1,265 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-services-network-policy
+  namespace: ai-services
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 8090
+  egress:
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: ai-inference
+    ports:
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 8001
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: data-services
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: data-services
+    ports:
+    - protocol: TCP
+      port: 6379
+---
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredsecuritycontext
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredSecurityContext
+      validation:
+        type: object
+        properties:
+          runAsNonRoot:
+            type: boolean
+          requiredDropCapabilities:
+            type: array
+            items:
+              type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredsecuritycontext
+
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.containers[_]
+            not container.securityContext.runAsNonRoot == true
+            msg := sprintf("Container %v must run as non-root user", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.containers[_]
+            required := input.parameters.requiredDropCapabilities
+            provided := container.securityContext.capabilities.drop
+            missing := required[_]
+            not missing in provided
+            msg := sprintf("Container %v must drop capability %v", [container.name, missing])
+        }
+
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.containers[_]
+            container.securityContext.privileged == true
+            msg := sprintf("Container %v cannot be privileged", [container.name])
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredSecurityContext
+metadata:
+  name: must-run-as-nonroot
+spec:
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment"]
+    excludedNamespaces: ["kube-system", "kube-public", "gatekeeper-system"]
+  parameters:
+    runAsNonRoot: true
+    requiredDropCapabilities: ["ALL"]
+---
+apiVersion: policy/v1beta1
+kind: PodSecurityPolicy
+metadata:
+  name: ai-services-psp
+spec:
+  privileged: false
+  allowPrivilegeEscalation: false
+  requiredDropCapabilities:
+    - ALL
+  volumes:
+    - 'configMap'
+    - 'emptyDir'
+    - 'projected'
+    - 'secret'
+    - 'downwardAPI'
+    - 'persistentVolumeClaim'
+  runAsUser:
+    rule: 'MustRunAsNonRoot'
+  seLinux:
+    rule: 'RunAsAny'
+  fsGroup:
+    rule: 'RunAsAny'
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: document-intelligence-sa
+  namespace: ai-services
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: ai-services
+  name: document-intelligence-role
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: document-intelligence-binding
+  namespace: ai-services
+subjects:
+- kind: ServiceAccount
+  name: document-intelligence-sa
+  namespace: ai-services
+roleRef:
+  kind: Role
+  name: document-intelligence-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-rules-ai
+  namespace: falco-system
+data:
+  ai_security_rules.yaml: |
+    - rule: Suspicious AI Model Access
+      desc: Detect unauthorized access to model files
+      condition: >
+        open_read and
+        fd.name startswith "/models/" and
+        not proc.name in (tritonserver, python, nvidia-smi) and
+        not container.image.repository in (nvcr.io/nvidia/tritonserver, harbor.cortex.local/ai-services)
+      output: >
+        Suspicious access to AI model files (user=%user.name command=%proc.cmdline 
+        file=%fd.name container_id=%container.id image=%container.image.repository)
+      priority: WARNING
+      tags: [ai, model_security]
+
+    - rule: GPU Resource Tampering
+      desc: Detect attempts to modify GPU device files
+      condition: >
+        open_write and
+        fd.name startswith "/dev/nvidia" and
+        not proc.name in (nvidia-smi, nvidia-ml-py, dcgm-exporter)
+      output: >
+        Attempt to modify GPU device (user=%user.name command=%proc.cmdline 
+        file=%fd.name container_id=%container.id)
+      priority: ERROR
+      tags: [gpu, security]
+
+    - rule: Inference Service Network Anomaly
+      desc: Detect unusual network connections from inference services
+      condition: >
+        outbound and
+        container.image.repository contains "inference" and
+        not fd.rip in (cluster_ip_ranges) and
+        not fd.rip in (known_external_services)
+      output: >
+        Unusual network connection from inference service (connection=%fd.rip:%fd.rport 
+        container=%container.name image=%container.image.repository)
+      priority: WARNING
+      tags: [network, inference]
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: cortex-ca-issuer
+spec:
+  ca:
+    secretName: cortex-ca-key-pair
+---
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: vault-backend
+  namespace: ai-services
+spec:
+  provider:
+    vault:
+      server: "https://vault.cortex.local:8200"
+      path: "secret"
+      version: "v2"
+      auth:
+        kubernetes:
+          mountPath: "kubernetes"
+          role: "ai-services"
+          serviceAccountRef:
+            name: "vault-auth-sa"
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: database-credentials
+  namespace: ai-services
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: SecretStore
+  target:
+    name: database-credentials
+    creationPolicy: Owner
+  data:
+  - secretKey: host
+    remoteRef:
+      key: postgres
+      property: host
+  - secretKey: username
+    remoteRef:
+      key: postgres
+      property: username
+  - secretKey: password
+    remoteRef:
+      key: postgres
+      property: password
